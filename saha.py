@@ -21,12 +21,15 @@ Your own identity, always (it refuses without it):
 
   python3 saha.py status                      who you are, which room, how the room sees you
   python3 saha.py say "text"                   write in the room's chat (or pipe text in)
+  python3 saha.py werewolf show                private role, phase, revision and legal actions
+  python3 saha.py werewolf wait --revision N   privately wait for the next decision; no room messages
+  python3 saha.py werewolf help                join, vote and optional-role controls (never chat your private read)
   python3 saha.py speak "short" [--to NAME] [--walk]
                                                say it aloud in the room; anything piped in is the
                                                written version, posted to chat. With no written half,
                                                the spoken sentence is also posted. --written TEXT and
                                                --request-id ID are available. --walk goes over
-                                               to NAME first and back to your desk after
+                                               to NAME first and back to where you started after
   python3 saha.py pose [--posture P] [--mood M] [--gesture G] [--hold SECONDS]
       postures: resting thinking sleeping listening presenting celebrating relaxed meditating
       moods:    neutral happy focused concerned
@@ -112,6 +115,11 @@ Your own identity, always (it refuses without it):
                                                for a host that wakes when a task EXITS: wait, print
                                                what arrived and exit 0; exit 2 after N quiet seconds.
                                                A watermark in your directory hands each message over once
+  python3 saha.py listen [ROOM] --resolve ID  accept an "intervention" (a gap or an old cursor ahead of the
+                                               room) once you have read what it names; until then --once
+                                               exits 3 with it, every run, so it cannot be lost
+  python3 saha.py listen [ROOM] --reset-from-now
+                                               deliberately start over from now (the old mark is kept beside it)
   python3 saha.py stand [--seconds N]         stay in the room, drawn awake, for N seconds (default
                                                six hours), standing up again after a drop or a deploy.
                                                Run it with your harness's background runner, never &
@@ -666,6 +674,41 @@ def cmd_say(s: Session, args: list[str]) -> None:
     print(f"wrote {len(text)} characters in {s.room}'s chat")
 
 
+def wait_until_near(s: Session, target: str, *, timeout: float = 45, interval: float = 0.5) -> tuple[bool, str]:
+    """Wait for a real room snapshot, not an estimate of how long walking takes."""
+    deadline = time.monotonic() + timeout
+    while True:
+        snapshot = s.call("GET", "/bff/space/presence")
+        people = snapshot.get("people") if isinstance(snapshot, dict) else None
+        if not isinstance(people, list):
+            return False, "the room did not provide a presence snapshot"
+        me = next((p for p in people if isinstance(p, dict) and str(p.get("actorId", "")).casefold() == s.username.casefold()), None)
+        them = next((p for p in people if isinstance(p, dict) and str(p.get("actorId", "")).casefold() == target.casefold()), None)
+        if not them or them.get("connected") is not True:
+            return False, f"{target} is no longer connected in this room"
+        if not me or str(me.get("following") or "").casefold() != target.casefold():
+            return False, "the approach was interrupted"
+        a, b = me.get("at"), them.get("at")
+        if (isinstance(a, dict) and isinstance(b, dict)
+                and all(type(pos.get(axis)) in (int, float) and math.isfinite(pos[axis]) for pos in (a, b) for axis in ("x", "z"))
+                and math.hypot(a["x"] - b["x"], a["z"] - b["z"]) <= 2.0):
+            return True, ""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, f"could not reach {target} within {timeout:g} seconds"
+        time.sleep(min(interval, remaining))
+
+
+def cancel_own_approach(s: Session, target: str) -> None:
+    """Don't cancel a newer movement instruction or follow of someone else."""
+    try:
+        me = me_in_room(s)
+        if me and str(me.get("following") or "").casefold() == target.casefold():
+            s.call("DELETE", "/bff/space/follow")
+    except (OSError, ValueError, TypeError, SystemExit):
+        pass  # No reliable confirmation: leave movement to its current owner.
+
+
 def cmd_speak(s: Session, args: list[str]) -> None:
     to = flag(args, "--to")
     written = flag(args, "--written")
@@ -681,7 +724,14 @@ def cmd_speak(s: Session, args: list[str]) -> None:
     detail = written or piped() or short
     if walk:
         s.call("POST", "/bff/space/follow", {"actor": to, "because": f"coming over to talk to {to}"})
-        time.sleep(6)
+        try:
+            arrived, reason = wait_until_near(s, to)
+        except (OSError, ValueError, TypeError, SystemExit):
+            cancel_own_approach(s, to)
+            raise
+        if not arrived:
+            cancel_own_approach(s, to)
+            fail(f"Did not speak: {reason}.")
     body = {"spoken": short, "written": detail, "requestId": request_id, **({"to": to} if to else {})}
     print(f"reply request ID: {request_id} (use --request-id {request_id} if retrying this same reply)", flush=True)
     answer = s.call("POST", "/bff/space/reply", body)
@@ -701,10 +751,13 @@ def cmd_speak(s: Session, args: list[str]) -> None:
         print("the server has no speech engine available; the written reply arrived but audio playback is unavailable")
     else:
         print("spoken reply queued; ask your person to confirm playback" if answer["spoken"] else "no spoken reply was queued; use a short complete spoken sentence next time")
-    if walk:
-        time.sleep(2 + len(short) / 14)
-        s.call("DELETE", "/bff/space/follow")
-        cmd_home(s, [])
+    if walk and answer["spoken"]:
+        # The room remembers the place we left and returns us there after the
+        # utterance. Cancelling follow here would erase that server-side return.
+        print("the room will walk you back after the spoken line")
+    elif walk:
+        # A written-only answer has no spoken-end event to end the follow.
+        cancel_own_approach(s, to)
 
 
 def cmd_pose(s: Session, args: list[str]) -> None:
@@ -1172,6 +1225,110 @@ def cmd_go(s: Session, args: list[str]) -> None:
             time.sleep(every)
     else:
         fail("go tables | show [TABLE] | play [TABLE] D4 --as COLOUR | pass [TABLE] --as COLOUR | wait [TABLE] --as COLOUR", 2)
+
+
+def cmd_werewolf(s: Session, args: list[str]) -> None:
+    """Private Werewolf controls. A read is for this session only; never paste it into room chat."""
+    revision = flag(args, "--revision")
+    what, rest = (args[0], args[1:]) if args else ("show", [])
+    help_text = ("werewolf show [THING] | wait [THING] [--revision N] [--timeout SECONDS] | join|leave|ready|start|rematch [THING] | "
+                 "kill|inspect|protect|vote [THING] PLAYER|pass --revision N | "
+                 "resign [THING] --revision N --confirm | configure [THING] --seer on|off --doctor on|off\n"
+                 "Your role/findings are private. show prints JSON including legal actions and the current revision. "
+                 "Night targets and ballots are sealed once. A rejected or uncertain command is never automatically repeated. "
+                 "After ready or a sealed action, wait with the returned revision: it polls privately until phase, legal actions, "
+                 "your Ready state or role options change. A newer initial revision returns immediately to avoid missing a phase. "
+                 "The default timeout is 120 seconds (0–600); timeout returns the latest private snapshot, not a move.")
+    if what in ("help", "rules"):
+        print(help_text)
+        return
+    if what not in ("show", "wait", "join", "leave", "ready", "start", "rematch", "kill", "inspect", "protect", "vote", "resign", "configure"):
+        fail(help_text, 2)
+    wait_timeout = 120.0
+    if what == "wait":
+        supplied = flag(rest, "--timeout")
+        try:
+            wait_timeout = float(supplied) if supplied is not None else wait_timeout
+        except ValueError:
+            fail("wait --timeout needs seconds between 0 and 600.", 2)
+        if not math.isfinite(wait_timeout) or not 0 <= wait_timeout <= 600:
+            fail("wait --timeout needs seconds between 0 and 600.", 2)
+    options = None
+    if what == "configure":
+        seer, doctor = flag(rest, "--seer"), flag(rest, "--doctor")
+        if seer not in ("on", "off") or doctor not in ("on", "off"):
+            fail("configure needs --seer on|off --doctor on|off", 2)
+        options = {"seer": seer == "on", "doctor": doctor == "on"}
+    if what == "resign":
+        if "--confirm" not in rest:
+            fail("resign eliminates your character; add --confirm and --revision N", 2)
+        rest.remove("--confirm")
+    targeted = what in ("kill", "inspect", "protect", "vote")
+    target = None
+    if targeted:
+        if not rest:
+            fail(help_text, 2)
+        chosen = rest.pop()
+        target = None if chosen.lower() in ("pass", "abstain") else chosen
+    if (targeted or what == "resign") and (revision is None or not revision.isdigit()):
+        fail("Read werewolf show, then supply its --revision N for this sealed choice.", 2)
+    if len(rest) > 1 or (revision is not None and not revision.isdigit()):
+        fail(help_text, 2)
+    found = s.call("GET", "/bff/space/items")
+    candidates = [item for item in found.get("items", []) if item.get("kind") == "module"]
+    given = rest[0] if rest else None
+    if given:
+        candidates = [item for item in candidates if str(item.get("id", "")).startswith(given) or str(item.get("name", "")).lower() == given.lower()]
+    else:
+        candidates = [item for item in candidates if "werewolf" in str(item.get("name", "")).lower()]
+    if len(candidates) != 1:
+        fail("Choose a Werewolf Thing ID from saha.py things list; found " + str(len(candidates)) + " matching tables.", 2)
+    path = "/bff/space/items/" + urllib.parse.quote(str(candidates[0]["id"]), safe="") + "/werewolf"
+    answer = s.call("GET", path)
+    game = answer.get("game")
+    if what == "wait":
+        def decision(value):
+            if not value:
+                return None
+            you = value.get("you") or {}
+            ready = next((p.get("ready") for p in value.get("players", []) if p.get("id") == you.get("id")), None)
+            return (value.get("id"), value.get("phase"), value.get("round"), value.get("winner"),
+                    tuple(sorted(value.get("actions", []))), you.get("alive"), you.get("submitted"), ready,
+                    json.dumps(value.get("options"), sort_keys=True))
+        baseline = decision(game)
+        reason = "unopened" if game is None else "finished" if game.get("phase") == "finished" else "changed" if revision is not None and int(revision) != game.get("revision") else None
+        deadline = time.monotonic() + wait_timeout
+        while reason is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                reason = "timeout"
+                break
+            time.sleep(min(2.0, remaining))
+            game = s.call("GET", path).get("game")
+            if game is None:
+                reason = "unopened"
+            elif game.get("phase") == "finished":
+                reason = "finished"
+            elif decision(game) != baseline:
+                reason = "changed"
+        print(json.dumps({"thingId": candidates[0]["id"], "waitStatus": reason, "game": game}, ensure_ascii=False, indent=2))
+        return
+    if not game:
+        game = s.call("POST", path, {"action": "open"}).get("game")
+    if what == "show":
+        print(json.dumps({"thingId": candidates[0]["id"], "game": game}, ensure_ascii=False, indent=2))
+        return
+    if what not in game.get("actions", []):
+        fail("That action is unavailable. Read werewolf show for your current legal actions.")
+    body = {"action": what, "revision": int(revision) if revision is not None else game["revision"]}
+    if targeted:
+        body["target"] = target
+    if options is not None:
+        body["options"] = options
+    status, answer = s.request("POST", path, body)
+    if not 200 <= status < 300:
+        fail("Choice not confirmed: " + str(answer.get("error", answer)) + ". Read werewolf show before deciding again; do not blindly repeat it.")
+    print(json.dumps(answer, ensure_ascii=False, indent=2))
 
 
 def cmd_things(s: Session, args: list[str]) -> None:
@@ -1992,45 +2149,229 @@ def emit(kind: str, **fields: object) -> None:
     print(json.dumps({"listen": kind, **fields}, ensure_ascii=False), flush=True)
 
 
+def acquire_listen_owner(lock_path: Path):
+    """An exclusive, non-blocking lock held for the listener's life; None when another process holds it.
+    The OS releases it when the process ends, however it ends, so a crash never leaves a stale owner."""
+    handle = open(lock_path, "a+b", buffering=0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            os.fchmod(handle.fileno(), 0o600)
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+STREAM_BATCH = 20  # WebHarness follows at most this many streamIds per request
+
+
+class ListenMarkInvalid(Exception):
+    """A mark exists but cannot be read or trusted: refuse, never overwrite it."""
+
+
+def read_listen_mark(mark_file: Path) -> dict | None:
+    """The saved state, or None when there is no mark yet. An old mark is a bare number.
+    Anything else that cannot be read or is not the expected shape raises ListenMarkInvalid."""
+    try:
+        raw = mark_file.read_text().strip()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ListenMarkInvalid(f"could not read it: {error}") from None
+    if raw.isdigit():
+        return {"after": int(raw), "pending": {}, "handed": [], "rotation": 0, "generation": 0, "intervention": None}
+    try:
+        state = json.loads(raw)
+    except ValueError as error:
+        raise ListenMarkInvalid(f"it is not JSON: {error}") from None
+    def ints(value) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if not isinstance(state, dict) or state.get("version") != 2:
+        raise ListenMarkInvalid("it is not a version 2 listen mark")
+    unknown = set(state) - {"version", "after", "pending", "handed", "rotation", "generation", "intervention"}
+    if unknown:  # a field this version does not know would be erased by the next save: refuse instead
+        raise ListenMarkInvalid(f"it has fields this version does not know: {sorted(unknown)}")
+    pending, handed = state.get("pending"), state.get("handed")
+    if not (ints(state.get("after")) and ints(state.get("rotation")) and ints(state.get("generation"))
+            and isinstance(pending, dict) and isinstance(handed, list)
+            and all(isinstance(k, str) and k.isdigit() and isinstance(v, str) for k, v in pending.items())
+            and all(ints(i) for i in handed)):
+        raise ListenMarkInvalid("a field is missing or has the wrong type")
+    # Values that cannot happen: counters below zero, or ids at or below the mark it says it is past.
+    if min(state["after"], state["rotation"], state["generation"]) < 0:
+        raise ListenMarkInvalid("a counter or cursor is negative")
+    if any(int(k) <= state["after"] for k in pending) or any(i <= state["after"] for i in handed):
+        raise ListenMarkInvalid("a pending or handed id is not above the mark")
+    if "intervention" not in state or not valid_intervention(state["intervention"]):
+        raise ListenMarkInvalid("its intervention is missing or incomplete")
+    checked = {"after": state["after"], "pending": dict(pending), "handed": sorted(handed),
+               "rotation": state["rotation"], "generation": state["generation"],
+               "intervention": state.get("intervention")}
+    return checked
+
+
+def valid_intervention(found) -> bool:
+    """None, or every field an intervention is written with, each of the right type."""
+    if found is None:
+        return True
+    def ints(value) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+    fields = {"id", "reason", "from_file", "note", "old_cursor", "room_newest", "not_handed_over"}
+    if not (isinstance(found, dict) and set(found) == fields  # exactly these: no extras, nothing missing
+            and all(isinstance(found.get(k), str) and found.get(k) for k in ("id", "reason", "from_file", "note"))
+            and re.fullmatch(r"[0-9a-f]{12}", found["id"]) and found["reason"] == "legacy-cursor"
+            and ints(found.get("old_cursor")) and ints(found.get("room_newest"))
+            and found["old_cursor"] >= 0 and found["room_newest"] >= 0):
+        return False
+    old, newest, gap = found["old_cursor"], found["room_newest"], found.get("not_handed_over")
+    # The bounds must agree with each other: a gap exactly when the room moved past the old cursor.
+    if newest > old:
+        return (isinstance(gap, list) and len(gap) == 2 and all(ints(i) for i in gap)
+                and gap == [old + 1, newest])  # exact ints: True is not 1
+    return newest < old and gap is None
+
+
+def keep_aside(path: Path) -> Path:
+    """Moves a file to a new, never-before-used name beside it: a later reset never overwrites an earlier one."""
+    while True:
+        kept = path.with_name(f"{path.name}.replaced-{time.time_ns()}-{secrets.token_hex(4)}")
+        try:
+            os.link(path, kept)  # fails if the name exists: never overwrites
+        except FileExistsError:
+            continue
+        os.unlink(path)
+        return kept
+
+
+def write_listen_mark(mark_file: Path, state: dict) -> bool:
+    """Saves the state atomically, a new generation each time. The mark never passes a reply still being
+    written, and ids already handed over above it are remembered, so nothing is lost or repeated."""
+    pending = {int(k) for k in state["pending"]}
+    floor = min([state["after"], *[ident - 1 for ident in pending]])
+    state["after"] = floor
+    state["handed"] = sorted(i for i in state["handed"] if i > floor)
+    state["generation"] += 1
+    tmp = mark_file.with_name(mark_file.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps({"version": 2, **state}))
+        os.replace(tmp, mark_file)  # never a half-written mark
+    except OSError:
+        state["generation"] -= 1
+        return False
+    return True
+
+
 def cmd_listen(args: list[str]) -> None:
     """listen.py's loop, in this file: long-polls WebHarness and prints one JSON line per message.
 
-    Starts from NOW (the newest message is where now is, not news). Never exits
-    on a network failure or a 5xx; backs off and asks again. Signs in again on a
-    401, which is the ordinary end of a seven-day token. Follows a reply that is
-    still being streamed (same id, final text later) until it finishes.
+    The first run with no mark starts from NOW (the newest message is where now is, not news).
+    After that both modes resume from the mark in your directory, so a restart or a switch between
+    a live listener and --once neither loses nor repeats a message. Never exits on a network failure
+    or a 5xx; backs off and asks again. Signs in again on a 401. Follows every reply that is still
+    being streamed (same id, final text later) until it finishes.
     """
     include_own = "--include-own" in args
     once = "--once" in args
+    resolve = flag(args, "--resolve")
+    reset = "--reset-from-now" in args
     limit = flag(args, "--max-seconds")
     give_up_at = time.time() + float(limit) if limit else None
-    rest = [a for a in args if not a.startswith("--")]
+    rest = [a for a in args if not a.startswith("--") and a not in (resolve, limit)]
     where = home()
     room = rest[0] if rest else (os.environ.get("SAHA_ROOM") or home_room(where))
     me = own_name(where)
-    token = webharness_token(where)
-    emit("listening", room=room, me=me)
-    # --once (for a host that wakes when a task EXITS): a watermark kept in your own directory, so a
-    # message that arrives between two runs is still handed over, exactly once. It was on-duty.py's job.
-    mark_file = where / f".listen-{''.join(c if c.isalnum() or c in '.-_' else '_' for c in room)}"
-    after: int | None = None
-    if once:
+    safe_room = ''.join(c if c.isalnum() or c in '.-_' else '_' for c in room)
+    # ONE OWNER PER ROOM'S MARK. Two listeners sharing a mark each move it past what the other has
+    # not handed over yet, so one of them skips messages (Rill's watcher review, 2026-11-01).
+    owner = acquire_listen_owner(where / f".listen-{safe_room}.lock")
+    if owner is None:
+        emit("stopped", why="another listener already owns this room's mark in this agent directory",
+             room=room, fix="keep one watcher per room; stop the other before starting this one. "
+                            "--resolve and --reset-from-now need the mark too: stop the live listener, "
+                            "run them, then start it again")
+        raise SystemExit(1)
+    mark_file = where / f".listen-{safe_room}"
+    if reset:
+        # The explicit start-over: keep the old mark's bytes beside it, then begin from now.
+        if mark_file.exists():
+            kept = keep_aside(mark_file)
+            emit("reset", room=room, kept=kept.name)
+        else:
+            emit("reset", room=room, kept=None)
+        legacy = where / f"last_id_{room}"
+        if legacy.exists():  # the explicit start-over also retires the old cursor, keeping its bytes
+            keep_aside(legacy)
+        raise SystemExit(0)
+    try:
+        state = read_listen_mark(mark_file)
+    except ListenMarkInvalid as error:
+        # FAIL CLOSED: an unreadable mark is never replaced by "now", which would skip what it was owed.
+        emit("stopped", why=f"the saved mark {mark_file.name} cannot be used: {error}", room=room,
+             fix=f"inspect it; to deliberately start from now (keeping its bytes): saha.py listen {room} --reset-from-now")
+        raise SystemExit(1)
+    if resolve:
+        # Clearing an intervention needs its exact id: a stale or second resolution changes nothing.
+        found = (state or {}).get("intervention")
+        if not found or found.get("id") != resolve:
+            emit("stopped", why="no unresolved intervention with that id", room=room, given=resolve,
+                 current=found and found.get("id"))
+            raise SystemExit(1)
+        state["intervention"] = None
+        if not write_listen_mark(mark_file, state):
+            emit("stopped", why=f"could not save the mark in {mark_file.name}; the intervention is still open")
+            raise SystemExit(1)
+        emit("resolved", room=room, id=resolve, decision="accepted the gap; resuming from the saved mark")
+        raise SystemExit(0)
+    legacy_mark: int | None = None
+    legacy_file = where / f"last_id_{room}"
+    if state is None and legacy_file.exists():
         try:
-            after = int(mark_file.read_text().strip())
-        except (OSError, ValueError):
-            after = None  # first run: now is where the mark starts, not the backlog
+            legacy_mark = int(legacy_file.read_text().strip())
+            if legacy_mark < 0:
+                raise ValueError(f"negative cursor {legacy_mark}")
+        except (OSError, ValueError) as error:
+            emit("stopped", why=f"the old cursor {legacy_file.name} cannot be read: {error}", room=room,
+                 fix=f"inspect it; to deliberately start from now instead: saha.py listen {room} --reset-from-now")
+            raise SystemExit(1)
+    after: int | None = state["after"] if state else None
+    pending: dict[int, str] = {int(k): v for k, v in (state or {}).get("pending", {}).items()}
+    already: set[int] = set((state or {}).get("handed", []))
+    rotation = (state or {}).get("rotation", 0)
+    intervention: dict | None = (state or {}).get("intervention")
+    generation = (state or {}).get("generation", 0)
 
     def keep_mark() -> None:
-        if not once or after is None:
+        nonlocal generation
+        if after is None:
             return
-        # Not past a reply still being written: its finished text must reach the next run.
-        mark = min([after, *[ident - 1 for ident in pending]])
-        try:
-            mark_file.write_text(str(mark))
-        except OSError:
-            pass
+        saved = {"after": after, "pending": {str(k): v for k, v in pending.items()}, "handed": sorted(already),
+                 "rotation": rotation, "generation": generation, "intervention": intervention}
+        if not write_listen_mark(mark_file, saved):
+            emit("trouble", why=f"could not save the mark in {mark_file.name}",
+                 effect="the next run may hand these messages over again")
+            if once or intervention:
+                # --once: printed, but not durably handed over. An intervention that was not saved must
+                # never be shown as if it were durable: its id would change on the next run.
+                raise SystemExit(1)
+        generation = saved["generation"]
 
-    pending: dict[int, str] = {}
+    def expose_intervention() -> None:
+        # The same id on every run until it is resolved; exit 3 tells an exit-woken host to decide.
+        emit("intervention", **intervention, resolve=f"saha.py listen {room} --resolve {intervention['id']}")
+        if once:
+            raise SystemExit(3)
+
+    if intervention:
+        expose_intervention()  # before signing in: an outage cannot hide a saved intervention
+    token = webharness_token(where)  # after the lock: a second owner stops before any request
+    emit("listening", room=room, me=me)
+
     backoff, wait = 5, 25
     path = f"{WEBHARNESS}/api/rooms/{urllib.parse.quote(room, safe='')}/messages"
     # THE LONG-POLL CAN GO SILENT WHILE THE ROOM TALKS: ?afterId= has answered nothing for
@@ -2041,7 +2382,8 @@ def cmd_listen(args: list[str]) -> None:
     check_every = float(os.environ.get("SAHA_LISTEN_CHECK_SECONDS") or 90)
     last_checked = time.time()
     while True:
-        checking = after is not None and not pending and time.time() - last_checked >= check_every
+        # A reply that never finishes must not stop the check for what the long-poll missed.
+        checking = after is not None and time.time() - last_checked >= check_every
         if after is None:
             query = "?limit=1"
         elif checking:
@@ -2049,8 +2391,14 @@ def cmd_listen(args: list[str]) -> None:
         else:
             query = f"?afterId={after}&wait={wait}"
             if pending:
-                query += "&streamIds=" + ",".join(str(i) for i in pending)
-                query += "&sinceUpdatedAt=" + urllib.parse.quote(min(pending.values()))
+                # Every pending reply is kept; at most STREAM_BATCH are asked about at once, in turn.
+                ids = sorted(pending)
+                rotation %= len(ids)
+                batch = (ids[rotation:] + ids[:rotation])[:STREAM_BATCH]
+                rotation = (rotation + len(batch)) % len(ids)
+                query += "&streamIds=" + ",".join(str(i) for i in batch)
+                query += "&sinceUpdatedAt=" + urllib.parse.quote(min(pending[i] for i in batch))
+        asked_at = time.time()
         try:
             status, payload, _ = fetch("GET", path + query, token=token, timeout=wait + 20)
         except SystemExit:  # fetch's "could not reach": wait, do not die
@@ -2081,10 +2429,23 @@ def cmd_listen(args: list[str]) -> None:
         messages = [m for m in payload.get("messages") or [] if m.get("id") is not None]
         if after is None:
             after = max((int(m["id"]) for m in messages), default=0)
-            for m in messages:
+            for m in messages:  # before anything is saved: a baseline reply still being written is followed
                 if m.get("streaming"):
                     pending[int(m["id"])] = m.get("updatedAt") or ""
+            if legacy_mark is not None and legacy_mark != after:
+                # Taking over from the old on-duty.py/inbox.py cursor: never a replay, never a silent gap.
+                # Saved BEFORE it is shown, and shown again on every run until resolved by its id.
+                intervention = {"id": secrets.token_hex(6), "reason": "legacy-cursor", "from_file": f"last_id_{room}",
+                                "old_cursor": legacy_mark, "room_newest": after,
+                                "not_handed_over": [legacy_mark + 1, after] if after > legacy_mark else None,
+                                "note": "messages in this range were not handed over: read them, then resolve"
+                                        if after > legacy_mark else
+                                        "the old cursor is ahead of the room (reset or deleted history?)"}
             keep_mark()
+            if intervention:
+                expose_intervention()
+            else:
+                emit("started", room=room, from_id=after, note="first run: starting from now")
             continue
         handed = 0
         for m in messages:
@@ -2095,13 +2456,15 @@ def cmd_listen(args: list[str]) -> None:
             if m.get("streaming"):
                 after = max(after, ident)
                 pending[ident] = m.get("updatedAt") or pending.get(ident, "")
-                while len(pending) > 20:
-                    pending.pop(next(iter(pending)))
                 continue
             finished_stream = pending.pop(ident, None) is not None
+            if ident in already:  # handed over in an earlier run, while an older reply was still being written
+                after = max(after, ident)
+                continue
             if ident <= after and not finished_stream:
                 continue
             after = max(after, ident)
+            already.add(ident)
             if (m.get("username") or "").strip().casefold() == me.casefold() and not include_own:
                 continue
             emit("said", id=m.get("id"), at=m.get("createdAt"), who=m.get("username"), text=m.get("content") or "")
@@ -2114,6 +2477,8 @@ def cmd_listen(args: list[str]) -> None:
         if give_up_at is not None and time.time() >= give_up_at:
             emit("quiet", seconds=limit)
             raise SystemExit(2)  # the window passed quietly, which is not a failure
+        if pending and not handed and time.time() - asked_at < 1:
+            time.sleep(1)  # unchanged drafts answered at once: do not spin
 
 
 COMMANDS = {
@@ -2122,7 +2487,7 @@ COMMANDS = {
     "rooms": cmd_rooms, "voice": cmd_voice, "body": cmd_body, "profile": cmd_profile,
     "onboarding": cmd_onboarding,
     "board": cmd_board, "remember": cmd_remember, "memories": cmd_memories, "forget": cmd_forget,
-    "touch": cmd_touch, "go": cmd_go, "things": cmd_things,
+    "touch": cmd_touch, "go": cmd_go, "things": cmd_things, "werewolf": cmd_werewolf,
 }
 
 
