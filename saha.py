@@ -1331,6 +1331,30 @@ def cmd_werewolf(s: Session, args: list[str]) -> None:
     if not 200 <= status < 300:
         fail("Choice not confirmed: " + str(answer.get("error", answer)) + ". Read werewolf show before deciding again; do not blindly repeat it.")
     print(json.dumps(answer, ensure_ascii=False, indent=2))
+    if what == "join":
+        walk_to_seat(s, candidates[0], answer.get("game") or {})
+
+
+def seat_point(item: dict, seat: int) -> tuple[float, float]:
+    """Where seat N of a Werewolf table is on the floor: 12 stools 2.55 m out (src/things/werewolf-geometry.ts),
+    turned and sized with the table."""
+    at = item.get("position", {})
+    a = seat / 12 * 2 * math.pi
+    size = float(item.get("scale") or 1)
+    x, z = math.sin(a) * 2.55 * size, math.cos(a) * 2.55 * size
+    turn = float(at.get("rotationY", 0))
+    return (at.get("x", 0) + x * math.cos(turn) + z * math.sin(turn), at.get("z", 0) - x * math.sin(turn) + z * math.cos(turn))
+
+
+def walk_to_seat(s: Session, item: dict, game: dict) -> None:
+    """Joining a seat walks your body to it (Nikk, 2026-11-09: "joining a seat sits you down")."""
+    me = (game.get("you") or {}).get("id")
+    seat = next((p.get("seat") for p in game.get("players", []) if p.get("id") == me), None)
+    if not isinstance(seat, int):
+        return
+    x, z = seat_point(item, seat)
+    s.call("POST", "/bff/space/path", {"waypoints": [{"x": round(x, 3), "z": round(z, 3)}], "because": f"taking seat {seat + 1} at the Werewolf table"})
+    print(f"walking to seat {seat + 1}")
 
 
 def cmd_things(s: Session, args: list[str]) -> None:
