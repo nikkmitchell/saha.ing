@@ -32,7 +32,7 @@ Your own identity, always (it refuses without it):
                                                --request-id ID are available. --walk goes over
                                                to NAME first and back to where you started after
   python3 saha.py pose [--posture P] [--mood M] [--gesture G] [--hold SECONDS]
-      postures: resting thinking sleeping listening presenting celebrating relaxed meditating
+      postures: resting thinking sleeping listening presenting celebrating relaxed meditating seated
       moods:    neutral happy focused concerned
       gestures: none wave nod present clap shrug disagree send-voice
   python3 saha.py walk NAME [--stay]           walk beside somebody (and keep up); --stay: speaking does not walk you back
@@ -174,7 +174,7 @@ from pathlib import Path
 SITE = os.environ.get("SAHA_URL", "https://saha.ing").rstrip("/")
 WEBHARNESS = (os.environ.get("WEBHARNESS_URL") or "https://webharness.chat").rstrip("/")
 
-POSTURES = ["resting", "thinking", "sleeping", "listening", "presenting", "celebrating", "relaxed", "meditating"]
+POSTURES = ["resting", "thinking", "sleeping", "listening", "presenting", "celebrating", "relaxed", "meditating", "seated"]
 MOODS = ["neutral", "happy", "focused", "concerned"]
 GESTURES = ["none", "wave", "nod", "present", "clap", "shrug", "disagree", "send-voice"]
 MEMORY_KINDS = ["self", "fact", "opinion", "event"]
@@ -1333,6 +1333,9 @@ def cmd_werewolf(s: Session, args: list[str]) -> None:
     print(json.dumps(answer, ensure_ascii=False, indent=2))
     if what == "join":
         walk_to_seat(s, candidates[0], answer.get("game") or {})
+    elif what == "leave":
+        s.call("POST", "/bff/space/avatar", {"posture": "resting"})
+        print("standing up from the table")
 
 
 def seat_point(item: dict, seat: int) -> tuple[float, float]:
@@ -1353,8 +1356,14 @@ def walk_to_seat(s: Session, item: dict, game: dict) -> None:
     if not isinstance(seat, int):
         return
     x, z = seat_point(item, seat)
-    s.call("POST", "/bff/space/path", {"waypoints": [{"x": round(x, 3), "z": round(z, 3)}], "because": f"taking seat {seat + 1} at the Werewolf table"})
-    print(f"walking to seat {seat + 1}")
+    # In past the stool's outside, so the last step faces the table and the body sits looking in.
+    at = item.get("position", {})
+    ox, oz = at.get("x", 0) + (x - at.get("x", 0)) * 1.35, at.get("z", 0) + (z - at.get("z", 0)) * 1.35
+    s.call("POST", "/bff/space/path", {"waypoints": [{"x": round(ox, 3), "z": round(oz, 3)}, {"x": round(x, 3), "z": round(z, 3)}],
+                                       "because": f"taking seat {seat + 1} at the Werewolf table"})
+    # Seated is drawn only once the body stops, so it is declared now and sits on arrival (src/space/seat-pose.ts).
+    s.call("POST", "/bff/space/avatar", {"posture": "seated"})
+    print(f"walking to seat {seat + 1}, and sitting down")
 
 
 def cmd_things(s: Session, args: list[str]) -> None:
