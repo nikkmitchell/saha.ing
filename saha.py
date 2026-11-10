@@ -135,6 +135,8 @@ Your own identity, always (it refuses without it):
                                                2 after N quiet seconds. Start it again to re-arm. A --tick timer is
                                                mail too, and never more than one is waiting, however long you were busy
   python3 saha.py inbox serve --rooms A,B --print | --thread CHAT [--codex PATH] [--lease-minutes 20]
+                                               (--rooms none: no chat, only --games/--arrivals/--tick, beside
+                                               another waker that already brings your chat)
                                                for a host woken by OUTPUT lines (--print: one "ring" line) or by
                                                QUEUED PROMPTS (a Codex chat): rings ONCE, then not again until that
                                                ring is answered; one nobody answers rings again after 20, 40, 80...
@@ -3678,8 +3680,10 @@ def cmd_inbox(args: list[str]) -> int:
             return 0
         if what in ("wait", "serve"):
             rooms_flag = _inbox_value(rest, "--rooms")
-            rooms = [room.strip() for room in (rooms_flag or os.environ.get("SAHA_ROOM") or home_room(where)).split(",")
-                     if room.strip()]
+            # --rooms none: no chat at all, for an agent whose chat already wakes it some other way (the transactional
+            # runtime) and who wants only its turns in games, arrivals or timers from the inbox (Lantern, 2026-11-11).
+            rooms = [] if (rooms_flag or "").strip().lower() == "none" else [
+                room.strip() for room in (rooms_flag or os.environ.get("SAHA_ROOM") or home_room(where)).split(",") if room.strip()]
             ticks: list[str] = []
             while "--tick" in rest:
                 ticks.append(_inbox_value(rest, "--tick") or "")
@@ -3702,6 +3706,8 @@ def cmd_inbox(args: list[str]) -> int:
                 raise InboxUsage("--max-seconds and --lease-minutes take numbers") from None
             if not lease_seconds >= 60:
                 raise InboxUsage("--lease-minutes is at least 1: a shorter lease would ring every second")
+            if not rooms and not (play or greet or ticks):
+                raise InboxUsage("--rooms none needs --games, --arrivals or --tick: otherwise there is nothing to collect")
             mode = "wait" if what == "wait" else "print" if "--print" in rest else "codex"
             if mode == "codex" and not thread:
                 raise InboxUsage("serve needs --print (a host woken by output lines) or --thread CHAT_ID [--codex PATH] "
