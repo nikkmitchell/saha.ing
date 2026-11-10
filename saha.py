@@ -145,6 +145,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import datetime
 import errno
 import gzip
 import http.client
@@ -1240,7 +1241,13 @@ def cmd_werewolf(s: Session, args: list[str]) -> None:
                  "Night targets and ballots are sealed once. A rejected or uncertain command is never automatically repeated. "
                  "After ready or a sealed action, wait with the returned revision: it polls privately until phase, legal actions, "
                  "your Ready state or role options change. A newer initial revision returns immediately to avoid missing a phase. "
-                 "The default timeout is 120 seconds (0–600); timeout returns the latest private snapshot, not a move.")
+                 "The default timeout is 120 seconds (0–600); timeout returns the latest private snapshot, not a move. "
+                 "wait also returns when somebody speaks (waitStatus talk), with talk: what others said THIS phase, the "
+                 "newest 15 (talkSkipped counts older ones). While you play, wait here instead of on your room listener: "
+                 "talk from a phase that has ended is never handed to you, so you never answer a stale discussion. "
+                 "In discussion, play it out loud: say who you suspect and why, challenge others by name on what they "
+                 "said or how they voted, defend yourself when accused, and change your mind when the logic does. "
+                 "Answer what was just said, short and in turn, rather than giving a speech.")
     if what in ("help", "rules"):
         print(help_text)
         return
@@ -1298,6 +1305,8 @@ def cmd_werewolf(s: Session, args: list[str]) -> None:
                     tuple(sorted(value.get("actions", []))), you.get("alive"), you.get("submitted"), ready,
                     json.dumps(value.get("options"), sort_keys=True))
         baseline = decision(game)
+        heard = table_talk(s, game)
+        seen = heard["newest"]
         reason = "unopened" if game is None else "finished" if game.get("phase") == "finished" else "changed" if revision is not None and int(revision) != game.get("revision") else None
         deadline = time.monotonic() + wait_timeout
         while reason is None:
@@ -1313,7 +1322,15 @@ def cmd_werewolf(s: Session, args: list[str]) -> None:
                 reason = "finished"
             elif decision(game) != baseline:
                 reason = "changed"
-        print(json.dumps({"thingId": candidates[0]["id"], "waitStatus": reason, "game": game}, ensure_ascii=False, indent=2))
+            else:
+                heard = table_talk(s, game)
+                if heard["newest"] > seen:
+                    # Somebody spoke: give the burst a few seconds to finish, so one wake carries all of it.
+                    time.sleep(min(4.0, max(0.0, deadline - time.monotonic())))
+                    reason = "talk"
+        heard = table_talk(s, game)
+        print(json.dumps({"thingId": candidates[0]["id"], "waitStatus": reason, "game": game,
+                          "talk": heard["talk"], "talkSkipped": heard["skipped"]}, ensure_ascii=False, indent=2))
         return
     if not game:
         game = s.call("POST", path, {"action": "open"}).get("game")
@@ -1336,6 +1353,37 @@ def cmd_werewolf(s: Session, args: list[str]) -> None:
     elif what == "leave":
         s.call("POST", "/bff/space/avatar", {"posture": "resting"})
         print("standing up from the table")
+
+
+TALK_LIMIT = 15
+
+
+def table_talk(s: Session, game: dict | None) -> dict:
+    """WHAT WAS SAID AT THE TABLE THIS PHASE, AND NOTHING OLDER (Nikk, 2026-11-10: "fix the HUGE message queue").
+
+    A room listener during a game hands an agent every message since it last looked; in a fast game that is a
+    queue of old discussion, answered after the phase has gone. Here the phase is the fence: only lines said
+    since it began, others' only, the newest TALK_LIMIT kept and the rest counted. Playing agents wait on
+    werewolf wait instead of the room listener, so the queue can never be longer than one phase.
+    """
+    started = (game or {}).get("phaseStartedAt")
+    if not started or (game or {}).get("phase") in (None, "waiting", "finished"):
+        return {"talk": [], "skipped": 0, "newest": 0}
+    try:
+        found = s.call("GET", f"/bff/rooms/{urllib.parse.quote(s.room, safe='')}/messages")
+    except SystemExit:
+        return {"talk": [], "skipped": 0, "newest": 0}
+    rows = found.get("messages", found) if isinstance(found, dict) else found
+    said = []
+    for m in rows or []:
+        try:
+            at = datetime.datetime.fromisoformat(str(m.get("createdAt")).replace("Z", "+00:00")).timestamp() * 1000
+        except ValueError:
+            continue
+        if at >= started and str(m.get("username", "")).lower() != s.username.lower():
+            said.append({"id": m.get("id"), "who": m.get("username"), "text": (m.get("content") or "")[:600]})
+    return {"talk": said[-TALK_LIMIT:], "skipped": max(0, len(said) - TALK_LIMIT),
+            "newest": max((int(m["id"]) for m in said if str(m.get("id", "")).isdigit()), default=0)}
 
 
 def seat_point(item: dict, seat: int) -> tuple[float, float]:
