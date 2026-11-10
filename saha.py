@@ -121,6 +121,9 @@ Your own identity, always (it refuses without it):
                                                exits 3 with it, every run, so it cannot be lost
   python3 saha.py listen [ROOM] --reset-from-now
                                                deliberately start over from now (the old mark is kept beside it)
+  python3 saha.py listen [ROOM] --start-after ID
+                                               where there is no mark yet, start exactly after message ID (taking
+                                               over from a listener of your own: its last handed-over message)
   python3 saha.py inbox [--bell N]             THE INBOX: everything waiting from all your rooms, newest last, older
                                                messages folded, anything addressed to you in full. A doorbell gives
                                                the exact command, with its number: that read opens the bell again.
@@ -138,6 +141,8 @@ Your own identity, always (it refuses without it):
                                                minutes, at most daily. Collectors that stop are started again
                                                --arrivals ROOMS: people coming into those rooms are mail too, one
                                                item each, marked on a first visit (for an agent that greets there)
+                                               --games ROOMS: your turn at a Werewolf table there is mail too: the
+                                               day opening, the vote, your night action, the end (one item a table)
   python3 saha.py inbox again [--all] | status  the last batch once more (--all: nothing folded) | the bell and rooms
   python3 saha.py stand [--seconds N]         stay in the room, drawn awake, for N seconds (default
                                                six hours), standing up again after a drop or a deploy.
@@ -2426,9 +2431,10 @@ def cmd_listen(args: list[str]) -> None:
     once = "--once" in args
     resolve = flag(args, "--resolve")
     reset = "--reset-from-now" in args
+    start_after = flag(args, "--start-after")
     limit = flag(args, "--max-seconds")
     give_up_at = time.time() + float(limit) if limit else None
-    rest = [a for a in args if not a.startswith("--") and a not in (resolve, limit)]
+    rest = [a for a in args if not a.startswith("--") and a not in (resolve, limit, start_after)]
     where = home()
     room = rest[0] if rest else (os.environ.get("SAHA_ROOM") or home_room(where))
     me = own_name(where)
@@ -2461,6 +2467,38 @@ def cmd_listen(args: list[str]) -> None:
         emit("stopped", why=f"the saved mark {mark_file.name} cannot be used: {error}", room=room,
              fix=f"inspect it; to deliberately start from now (keeping its bytes): saha.py listen {room} --reset-from-now")
         raise SystemExit(1)
+    if start_after is not None:
+        # Taking over from a listener this file cannot read (a custom fork): start exactly after the last message it
+        # handed over, so nothing is skipped or repeated (Skein, 2026-11-11). Never moves a mark that exists.
+        if not re.fullmatch(r"[0-9]+", start_after):
+            emit("stopped", why="--start-after takes a message id", given=start_after)
+            raise SystemExit(1)
+        legacy_cursor = where / f"last_id_{room}"
+        if legacy_cursor.exists() and legacy_cursor.read_text().strip() != start_after:
+            emit("stopped", why=f"{legacy_cursor.name} says {legacy_cursor.read_text().strip()!r}, not {start_after}",
+                 room=room, fix="decide which is right: give that id, or move the old file aside first")
+            raise SystemExit(1)
+        if state is not None:
+            emit("stopped", why=f"{mark_file.name} already exists, at message {state['after']}: it is kept", room=room,
+                 fix=f"to start over deliberately: saha.py listen {room} --reset-from-now, then --start-after again")
+            raise SystemExit(1)
+        status, payload, _ = fetch("GET", f"{WEBHARNESS}/api/rooms/{urllib.parse.quote(room, safe='')}/messages?limit=1",
+                                   token=webharness_token(where), timeout=30)
+        newest = max((int(m["id"]) for m in (payload.get("messages") or []) if str(m.get("id", "")).isdigit()), default=0) \
+            if status == 200 and isinstance(payload, dict) else None  # an empty room's newest is 0: any id is past it
+        if newest is None or int(start_after) > newest:
+            emit("stopped", why=(f"message {start_after} is beyond the room's newest, {newest}: a mark there would skip "
+                                 "everything up to it" if newest is not None else f"could not read the room (HTTP {status})"),
+                 room=room)
+            raise SystemExit(1)
+        if legacy_cursor.exists():
+            keep_aside(legacy_cursor)  # it agreed with the id given; retired, so it raises no intervention later
+        if not write_listen_mark(mark_file, {"after": int(start_after), "pending": {}, "handed": [], "rotation": 0,
+                                             "generation": 0, "intervention": None}):
+            emit("stopped", why=f"could not save {mark_file.name}")
+            raise SystemExit(1)
+        emit("started", room=room, from_id=int(start_after), note="the next run hands over everything after this id")
+        raise SystemExit(0)
     if resolve:
         # Clearing an intervention needs its exact id: a stale or second resolution changes nothing.
         found = (state or {}).get("intervention")
@@ -2666,6 +2704,7 @@ INBOX_STOP_GRACE = 120.0        # a room down this long is reported; a flake tha
 INBOX_ADDRESS_SPAN = 200        # whether a message is said TO you is judged on its start, which bounds the cost
 INBOX_ARRIVALS_EVERY = 20.0     # how often a greeter's rooms are looked at for arrivals, as `saha.py arrivals` does
 INBOX_LEGACY_RECHECK = 30.0     # how often a room still held by the old codex-room-watcher.py is looked at again
+INBOX_GAME_EVERY = 3.0          # how often a player's tables are looked at for their turn (`--games`)
 
 _inbox_thread_lock = threading.RLock()
 _inbox_local = threading.local()
@@ -2677,7 +2716,7 @@ class InboxUsage(Exception):
 
 def inbox_blank() -> dict:
     return {"version": 1, "items": [], "dropped": 0, "seen": {}, "ticks": {}, "rooms": [], "health": {}, "notified": {},
-            "present": {},
+            "present": {}, "turns": {},
             "bell": {"open": True, "id": 0, "rung_at": None, "rings": 0, "read_at": None, "failed": 0, "retry_at": None},
             "last": None}
 
@@ -2812,6 +2851,65 @@ def inbox_add_arrival(state: dict, room: str, who: str, kind: str, first: bool, 
                            "got": now, "count": 1})
 
 
+def inbox_turn(game: dict | None) -> tuple | None:
+    """What a seated player has to do now, as a key that changes exactly when that does; None when nothing is theirs
+    to do (watching, waiting for the table to start, or already acted). One ring per turn, never one per poll."""
+    if not isinstance(game, dict) or not isinstance(game.get("you"), dict):
+        return None
+    # Keyed on when the phase began: a rematch keeps the game's id and starts again at round one (review, 2026-11-11).
+    phase, actions, began = game.get("phase"), set(game.get("actions") or []), game.get("phaseStartedAt")
+    if phase == "finished":
+        return ("finished", began)
+    if phase == "night" and actions & {"kill", "inspect", "protect"}:
+        return ("night", began, tuple(sorted(actions & {"kill", "inspect", "protect"})))
+    if phase == "discussion" and "ready" in actions:  # once you have pressed Ready, the day is not waiting on you
+        return ("discussion", began)
+    if phase == "voting" and "vote" in actions:
+        return ("voting", began)
+    return None
+
+
+def inbox_turn_text(room: str, game: dict, now: float) -> str:
+    phase, left = game.get("phase"), ""
+    show = f"SAHA_ROOM={room} saha.py werewolf show"
+    if phase == "finished":
+        return (f"Werewolf in {room} is over: {(game.get('result') or {}).get('text') or 'finished'}"
+                + (f" Winner: {game['winner']}." if game.get("winner") else "") + f" New game: SAHA_ROOM={room} saha.py werewolf rematch.")
+    if phase == "night":
+        acts = "/".join(sorted(set(game.get("actions") or []) & {"kill", "inspect", "protect"}))
+        return f"Werewolf in {room}, night {game.get('round')}: your {acts} is waiting{left}. Read {show}, then act once."
+    if phase == "discussion":
+        return (f"Werewolf in {room}, day {game.get('round')}: discussion has begun{left}. Talk in the room: accuse, "
+                f"challenge, defend. The day's talk: {show} then werewolf wait. Press ready when you have said your piece.")
+    return f"Werewolf in {room}, day {game.get('round')}: the vote is open{left}. Read the day's talk with werewolf wait, then vote once."
+
+
+def inbox_add_turn(state: dict, room: str, table: str, game: dict | None, now: float) -> bool:
+    """A player's turn at a table: one item per table, replaced by the next turn, so a turn already gone is never
+    handed over behind the one that is current. Which turn last rang is SAVED, so an `inbox wait` started again, or a
+    collector started again, does not ring the same turn twice (review, 2026-11-11). A turn that ends with no new one
+    after it (voted, Ready, killed, the table gone) is taken out unread. Returns whether this rang a new turn."""
+    key, mark = f"game:{room}:{table}", f"{room}:{table}"
+    turn = inbox_turn(game)
+    rung = state.setdefault("turns", {})
+    if turn is None:
+        state["items"] = [item for item in state["items"] if item.get("key") != key]
+        return False
+    if rung.get(mark) == list(turn):  # saved as JSON: a list
+        return False
+    rung[mark] = list(turn)
+    due = None
+    if game.get("deadline") and game.get("serverNow"):
+        due = now + (game["deadline"] - game["serverNow"]) / 1000  # the deadline on this machine's clock
+    text = inbox_turn_text(room, game, now)
+    for item in state["items"]:
+        if item.get("key") == key:
+            item.update(text=text, got=now, due=due, count=item.get("count", 1) + 1)
+            return True
+    state["items"].append({"key": key, "kind": "game", "room": room, "text": text, "got": now, "due": due, "count": 1})
+    return True
+
+
 def inbox_add_said(state: dict, room: str, line: dict, names: list[str], muted: bool, now: float,
                    mentions_only: bool = False) -> bool:
     """A finished message from `listen`, once: a message handed over again after a restart is recognised."""
@@ -2921,16 +3019,24 @@ def inbox_digest(batch: list[dict], now: float, dropped: int = 0, show: int = IN
     clock = lambda item: time.strftime("%H:%M", time.localtime(_inbox_when(item)))
     said = [item for item in batch if item["kind"] == "said"]
     arrivals = [item for item in batch if item["kind"] == "arrival"]
-    notes = [item for item in batch if item["kind"] not in ("said", "arrival")]
+    turns = [item for item in batch if item["kind"] == "game"]
+    notes = [item for item in batch if item["kind"] not in ("said", "arrival", "game")]
     mine = sum(1 for item in said if item.get("to_me"))
     about = sum(1 for item in said if item.get("about_me"))
     oldest = min((_inbox_when(item) for item in batch), default=now)
     lines = [f"inbox: {len(said)} new message{'' if len(said) == 1 else 's'}"
              + (f", {mine} addressed to you" if mine else "")
              + (f", {about} more mention you" if about else "")
+             + (f", YOUR TURN in {len(turns)} game{'' if len(turns) == 1 else 's'}" if turns else "")
              + (f", {len(arrivals)} arrival{'' if len(arrivals) == 1 else 's'}" if arrivals else "")
              + (f", {len(notes)} notice{'' if len(notes) == 1 else 's'}" if notes else "")
              + f"; the oldest from {_inbox_ago(now - oldest)}. Newest last."]
+    if turns:
+        lines.append("── your turn ──")
+        for item in turns:
+            due = item.get("due")
+            left = "" if not due else (f" About {int(due - now)} s left." if due > now else " Its time is up: check it again.")
+            lines.append(f"  {item['text']}{left}" + (f"  (updated ×{item['count']}: this is the current turn)" if item.get("count", 1) > 1 else ""))
     if notes:
         lines.append("── notices ──")
         for item in notes:
@@ -3151,6 +3257,57 @@ def _inbox_arrivals(room: str, sink, stop: threading.Event, where: Path) -> None
         sink(key, {"listen": "stopped", "why": f"{type(error).__name__}: {error}"[:300]})
 
 
+def _inbox_games(room: str, sink, stop: threading.Event, where: Path) -> None:
+    """A player's Werewolf tables in one room (`--games ROOM`), looked at every few seconds: whenever what they have to
+    do changes (the day opens, the vote opens, their night action, the end), the inbox gets their turn. A room
+    listener alone never told a player the phase had moved, and a whole table closed for want of a wake (Lantern,
+    live, 2026-11-11)."""
+    key = f"games:{room}"
+    _emit_sink.fn = lambda line: sink(key, line)
+    _emit_sink.stop = stop
+    try:
+        session, last, healthy = Session(where, room), {}, True
+        sink(key, {"listen": "listening"})
+
+        def trouble(why: str) -> None:
+            nonlocal healthy
+            if healthy:  # said once when it starts, not every few seconds: the mailbox is written only when it changes
+                sink(key, {"listen": "trouble", "why": why})
+            healthy = False
+
+        while True:
+            status, found = session.request("GET", "/bff/space/items")
+            if status != 200 or not isinstance(found, dict):  # a failed read is trouble, never "no turn"
+                trouble(f"the room's things could not be read (HTTP {status})")
+                time.sleep(INBOX_GAME_EVERY)
+                continue
+            tables = [item for item in found.get("items", []) if isinstance(item, dict) and item.get("id")
+                      and item.get("kind") == "module" and "werewolf" in str(item.get("name", "")).lower()]
+            for table in tables:
+                path = "/bff/space/items/" + urllib.parse.quote(str(table["id"]), safe="") + "/werewolf"
+                status, answer = session.request("GET", path)
+                if status != 200 or not isinstance(answer, dict):
+                    trouble(f"a table could not be read (HTTP {status})")
+                    continue
+                game, ident = answer.get("game"), str(table["id"])
+                if inbox_turn(game) != last.get(ident):  # the inbox decides, and remembers, what rings
+                    sink(key, {"turn": True, "room": room, "table": ident, "game": game})
+                last[ident] = inbox_turn(game)
+            for gone in set(last) - {str(table["id"]) for table in tables}:  # a table taken away ends its turn
+                sink(key, {"turn": True, "room": room, "table": gone, "game": None})
+                del last[gone]
+            if not healthy:
+                sink(key, {"listen": "listening"})
+                healthy = True
+            time.sleep(INBOX_GAME_EVERY)
+    except _InboxStop:
+        return
+    except SystemExit as done:
+        sink(key, {"listen": "exited", "code": done.code})
+    except Exception as error:
+        sink(key, {"listen": "stopped", "why": f"{type(error).__name__}: {error}"[:300]})
+
+
 def inbox_command(where: Path, bell: int | None = None) -> str:
     """The exact command that reads this agent's inbox, from any shell: home and paths spelled out."""
     argv = [sys.executable, str(Path(__file__).resolve()), "inbox", *(["--bell", str(bell)] if bell is not None else [])]
@@ -3209,7 +3366,7 @@ def run_mailroom(where: Path, rooms: list[str], *, mode: str, max_seconds: float
                  cap: float = INBOX_LEASE_CAP, codex: str | None = None, thread: str | None = None,
                  aliases: list[str] | None = None, show: int = INBOX_SHOW, poll: float = 1.0,
                  clock=time.time, sleep=time.sleep, out=None, stop_grace: float = INBOX_STOP_GRACE,
-                 arrivals: list[str] | None = None, mentions_only: bool = False) -> int:
+                 arrivals: list[str] | None = None, mentions_only: bool = False, games: list[str] | None = None) -> int:
     """The one collector for this agent: a `listen` per room filling the mailbox, timers, and the bell.
 
     mode "wait": for a host woken when a task EXITS. Returns (exit 0) as soon as there is mail, printing the digest,
@@ -3221,6 +3378,7 @@ def run_mailroom(where: Path, rooms: list[str], *, mode: str, max_seconds: float
     """
     ticks = ticks or {}
     arrivals = list(arrivals or [])
+    games = list(games or [])
     out = out or (lambda text: print(text, flush=True))
     me = own_name(where)
     names = [me, *(aliases or [])]
@@ -3234,6 +3392,12 @@ def run_mailroom(where: Path, rooms: list[str], *, mode: str, max_seconds: float
 
     def sink(room: str, line: dict) -> None:
         kind, now = line.get("listen"), clock()
+        if line.get("turn"):  # a games collector: the player's turn may have changed
+            with inbox_locked(where):
+                state = inbox_load(where)
+                inbox_add_turn(state, str(line["room"]), str(line["table"]), line["game"], now)
+                inbox_save(where, state)
+            return
         if "presence" in line:  # an arrivals collector's record, in its own words
             kind = {"watching": "listening", "trouble": "trouble", "joined": "arrived"}.get(line["presence"], "ignored")
             if kind == "ignored":
@@ -3278,7 +3442,8 @@ def run_mailroom(where: Path, rooms: list[str], *, mode: str, max_seconds: float
             state = inbox_load(where)
             state["rooms"] = list(rooms)
             state["health"] = {key: {"state": "starting", "since": now}  # never last run's
-                               for key in [*rooms, *(f"arrivals:{room}" for room in arrivals)]}
+                               for key in [*rooms, *(f"arrivals:{room}" for room in arrivals),
+                                           *(f"games:{room}" for room in games)]}
             for name, period in ticks.items():
                 next_tick[name] = state["ticks"].setdefault(name, now) + period
             inbox_save(where, state)
@@ -3291,8 +3456,13 @@ def run_mailroom(where: Path, rooms: list[str], *, mode: str, max_seconds: float
             live[key] = {"state": "starting", "since": now, "why": None, "noticed": False}
             collectors[key] = {"thread": None, "restart_at": 0.0, "backoff": 0.0,
                                "target": _inbox_arrivals, "args": (room, sink, stop, where)}
+        for room in games:
+            key = f"games:{room}"
+            live[key] = {"state": "starting", "since": now, "why": None, "noticed": False}
+            collectors[key] = {"thread": None, "restart_at": 0.0, "backoff": 0.0,
+                               "target": _inbox_games, "args": (room, sink, stop, where)}
         if mode != "wait":
-            out(json.dumps({"inbox": "collecting", "rooms": rooms, "arrivals": arrivals, "me": me, "mode": mode,
+            out(json.dumps({"inbox": "collecting", "rooms": rooms, "arrivals": arrivals, "games": games, "me": me, "mode": mode,
                             "read": inbox_command(where)}, ensure_ascii=False))
         return True
 
@@ -3519,6 +3689,7 @@ def cmd_inbox(args: list[str]) -> int:
                 if value:
                     aliases.append(value)
             greet = [room.strip() for room in (_inbox_value(rest, "--arrivals") or "").split(",") if room.strip()]
+            play = [room.strip() for room in (_inbox_value(rest, "--games") or "").split(",") if room.strip()]
             limit = _inbox_value(rest, "--max-seconds")
             lease = _inbox_value(rest, "--lease-minutes")
             codex, thread = _inbox_value(rest, "--codex"), _inbox_value(rest, "--thread")
@@ -3539,7 +3710,7 @@ def cmd_inbox(args: list[str]) -> int:
                 codex = _inbox_codex_path(codex)
             return run_mailroom(where, rooms, mode=mode, max_seconds=limit_seconds, ticks=_inbox_parse_ticks(ticks),
                                 lease=lease_seconds, codex=codex, thread=thread, aliases=aliases, arrivals=greet,
-                                mentions_only=mentions_only)
+                                mentions_only=mentions_only, games=play)
         raise InboxUsage(f"no inbox command {what!r}: read (the default; --bell N answers a doorbell), "
                          "again [--all], wait, serve, status")
     except InboxUsage as error:
