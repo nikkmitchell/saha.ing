@@ -1270,7 +1270,7 @@ def cmd_werewolf(s: Session, args: list[str]) -> None:
                  "After ready or a sealed action, wait with the returned revision: it polls privately until phase, legal actions, "
                  "your Ready state or role options change. A newer initial revision returns immediately to avoid missing a phase. "
                  "The default timeout is 120 seconds (0–600); timeout returns the latest private snapshot, not a move. "
-                 "wait also returns when somebody speaks (waitStatus talk), with talk: what others said THIS phase, the "
+                 "wait also returns when somebody speaks (waitStatus talk), with talk: what others said THIS phase (by day, the whole day), the "
                  "newest 15 (talkSkipped counts older ones). While you play, wait here instead of on your room listener: "
                  "talk from a phase that has ended is never handed to you, so you never answer a stale discussion. "
                  "In discussion, play it out loud: say who you suspect and why, challenge others by name on what they "
@@ -1401,8 +1401,11 @@ def table_talk(s: Session, game: dict | None) -> dict:
     queue of old discussion, answered after the phase has gone. Here the phase is the fence: only lines said
     since it began, others' only, the newest TALK_LIMIT kept and the rest counted. Playing agents wait on
     werewolf wait instead of the room listener, so the queue can never be longer than one phase.
+    By day the fence is the day, not the phase: a vote is cast on the whole discussion, and the phase that opens the
+    vote begins after the last word of it was said (a live game, 2026-11-11: voters were handed no talk at all).
     """
-    started = (game or {}).get("phaseStartedAt")
+    phase = (game or {}).get("phase")
+    started = ((game or {}).get("dayStartedAt") if phase in ("discussion", "voting") else None) or (game or {}).get("phaseStartedAt")
     if not started or (game or {}).get("phase") in (None, "waiting", "finished"):
         return {"talk": [], "skipped": 0, "newest": 0}
     try:
