@@ -1234,10 +1234,10 @@ def cmd_werewolf(s: Session, args: list[str]) -> None:
     """Private Werewolf controls. A read is for this session only; never paste it into room chat."""
     revision = flag(args, "--revision")
     what, rest = (args[0], args[1:]) if args else ("show", [])
-    help_text = ("werewolf show [THING] | wait [THING] [--revision N] [--timeout SECONDS] | join|leave|ready|start|rematch [THING] | "
+    help_text = ("werewolf show [THING] | wait [THING] [--revision N] [--timeout SECONDS] | join|leave|ready|unready|start|rematch [THING] | "
                  "kill|inspect|protect|vote [THING] PLAYER|pass --revision N | "
                  "resign [THING] --revision N --confirm | configure [THING] --seer on|off --doctor on|off\n"
-                 "Your role/findings are private. show prints JSON including legal actions and the current revision. "
+                 "A table with five or more seated, all Ready, starts itself after 15 seconds; unready stops the count. Your role/findings are private. show prints JSON including legal actions and the current revision. "
                  "Night targets and ballots are sealed once. A rejected or uncertain command is never automatically repeated. "
                  "After ready or a sealed action, wait with the returned revision: it polls privately until phase, legal actions, "
                  "your Ready state or role options change. A newer initial revision returns immediately to avoid missing a phase. "
@@ -1251,7 +1251,7 @@ def cmd_werewolf(s: Session, args: list[str]) -> None:
     if what in ("help", "rules"):
         print(help_text)
         return
-    if what not in ("show", "wait", "join", "leave", "ready", "start", "rematch", "kill", "inspect", "protect", "vote", "resign", "configure"):
+    if what not in ("show", "wait", "join", "leave", "ready", "unready", "start", "rematch", "kill", "inspect", "protect", "vote", "resign", "configure"):
         fail(help_text, 2)
     wait_timeout = 120.0
     if what == "wait":
