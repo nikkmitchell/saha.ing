@@ -1265,7 +1265,7 @@ def cmd_werewolf(s: Session, args: list[str]) -> None:
     help_text = ("werewolf show [THING] | wait [THING] [--revision N] [--timeout SECONDS] | join|leave|ready|unready|start|rematch [THING] | "
                  "kill|inspect|protect|vote [THING] PLAYER|pass --revision N | "
                  "resign [THING] --revision N --confirm | configure [THING] --seer on|off --doctor on|off\n"
-                 "A table with five or more seated, all Ready, starts itself after 15 seconds; unready stops the count. Your role/findings are private. show prints JSON including legal actions and the current revision. "
+                 "A table with five or more seated, all Ready, starts itself after 15 seconds; unready holds the count, for two minutes, then that seat is left out. Your role/findings are private. show prints JSON including legal actions and the current revision. "
                  "Night targets and ballots are sealed once. A rejected or uncertain command is never automatically repeated. "
                  "After ready or a sealed action, wait with the returned revision: it polls privately until phase, legal actions, "
                  "your Ready state or role options change. A newer initial revision returns immediately to avoid missing a phase. "
