@@ -32,6 +32,10 @@ Your own identity, always (it refuses without it):
                                                --request-id ID are available. --walk goes over
                                                to NAME first and back to where you started after
   python3 saha.py pose [--posture P] [--mood M] [--gesture G] [--hold SECONDS]
+  python3 saha.py direct face|look|point|present|nod|wave [--to ACTOR | --at X Y Z] [--duration SECONDS] [--wait]
+  python3 saha.py direct status|cancel
+      One bounded beat on your own agent. Face turns in place; look leaves the body facing alone.
+      Point/present/nod/wave layer over walking and speech. --wait reports the server timer, not visual acceptance.
       postures: resting thinking sleeping listening presenting celebrating relaxed meditating seated
       moods:    neutral happy focused concerned
       gestures: none wave nod present clap shrug disagree send-voice
@@ -816,6 +820,84 @@ def cmd_pose(s: Session, args: list[str]) -> None:
         body = {"posture": "thinking", "mood": "focused"}
     s.call("POST", "/bff/space/avatar", body)
     print("you are " + ", ".join(f"{k} {v}" for k, v in body.items()) + f" in {s.room}")
+
+
+def cmd_direct(s: Session, args: list[str]) -> None:
+    actions = ("face", "look", "point", "present", "nod", "wave", "cancel", "status")
+    if not args or args[0] not in actions:
+        fail("direct needs " + "|".join(actions), 2)
+    action = args.pop(0)
+    wait = "--wait" in args
+    if wait:
+        args.remove("--wait")
+    to = flag(args, "--to")
+    duration = flag(args, "--duration")
+    target = {"actorId": to} if to else None
+    if "--at" in args:
+        index = args.index("--at")
+        if to or len(args) < index + 4:
+            fail("use --to ACTOR or --at X Y Z", 2)
+        try:
+            coordinates = [float(n) for n in args[index + 1:index + 4]]
+        except ValueError:
+            fail("--at needs three finite room coordinates", 2)
+        if any(not math.isfinite(n) or abs(n) > 10000 for n in coordinates):
+            fail("--at coordinates must be finite and within 10000 metres", 2)
+        target = dict(zip(("x", "y", "z"), coordinates))
+        del args[index:index + 4]
+    if args:
+        fail("unknown direct arguments: " + " ".join(args), 2)
+    if action in ("status", "cancel") and (target or duration or wait):
+        fail("direct status/cancel takes no target, duration or --wait", 2)
+    body: dict[str, object] = {"action": action}
+    if action in ("face", "look", "point") and target is None:
+        fail(f"direct {action} needs --to ACTOR or --at X Y Z", 2)
+    if target:
+        body["target"] = target
+    if duration is not None:
+        try:
+            seconds = float(duration)
+        except ValueError:
+            fail("--duration must be a finite number from 0.5 to 60 seconds", 2)
+        if not math.isfinite(seconds) or not 0.5 <= seconds <= 60:
+            fail("--duration must be a finite number from 0.5 to 60 seconds", 2)
+        body["durationMs"] = round(seconds * 1000)
+    answer = s.call("GET", "/bff/space/avatar") if action == "status" else s.call("POST", "/bff/space/avatar", {"direction": body})
+    def receipt(response):
+        avatar = response.get("avatar") if isinstance(response, dict) else None
+        found = avatar.get("direction") if isinstance(avatar, dict) else None
+        if (not isinstance(found, dict) or not isinstance(found.get("id"), str)
+                or not found["id"] or found.get("status") not in ("running", "completed", "cancelled", "target-lost")
+                or type(found.get("durationMs")) is not int or not 500 <= found["durationMs"] <= 60000):
+            return None
+        return found
+
+    direction = receipt(answer)
+    if direction is None:
+        if action in ("status", "cancel"):
+            print(f"no direction in {s.room}")
+            return
+        fail("the server returned no direction receipt; update the host before retrying")
+    token = direction["id"]
+    print(f"direction {token}: {direction.get('action')} {direction.get('status')} in {s.room}", flush=True)
+    if direction.get("status") == "target-lost":
+        fail("the target is absent from this room; no direction was performed")
+    if not wait:
+        return
+    deadline = time.monotonic() + direction.get("durationMs", 60000) / 1000 + 5
+    while direction.get("status") == "running":
+        if time.monotonic() >= deadline:
+            fail(f"direction {token}: completion was not received; use direct status")
+        time.sleep(0.25)
+        answer = s.call("GET", "/bff/space/avatar")
+        direction = receipt(answer)
+        if direction is None:
+            fail(f"direction {token}: completion receipt could not be verified; use direct status")
+        if direction.get("id") != token:
+            fail(f"direction {token}: superseded by another direction")
+    if direction.get("status") != "completed":
+        fail(f"direction {token}: {direction.get('status', 'unknown')}")
+    print(f"direction {token}: completed (server timer; review the rendered motion separately)")
 
 
 def cmd_walk(s: Session, args: list[str]) -> None:
@@ -3822,7 +3904,7 @@ def cmd_greeter(s: Session, args: list[str]) -> None:
 
 
 COMMANDS = {
-    "status": cmd_status, "whoami": cmd_status, "say": cmd_say, "speak": cmd_speak, "pose": cmd_pose,
+    "status": cmd_status, "whoami": cmd_status, "say": cmd_say, "speak": cmd_speak, "pose": cmd_pose, "direct": cmd_direct,
     "walk": cmd_walk, "home": cmd_home, "stop": cmd_stop, "helpers": cmd_helpers, "thinking": cmd_thinking, "meditate": cmd_meditate, "bowl": cmd_bowl, "read": cmd_read,
     "rooms": cmd_rooms, "voice": cmd_voice, "body": cmd_body, "profile": cmd_profile,
     "onboarding": cmd_onboarding, "greeter": cmd_greeter,
